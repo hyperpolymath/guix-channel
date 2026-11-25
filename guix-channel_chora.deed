@@ -1,0 +1,17 @@
+;; SPDX-License-Identifier: MPL-2.0
+;; SPDX-FileCopyrightText: 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+;;
+;; The repo deed of guix-channel. :repo-uuid is the id minted once by the
+;; chora-registry (sync/uuid-v8.sh, domain chora-registry, birth path
+;; github.com/hyperpolymath/guix-channel; ADR 0008). It never changes, even on a move.
+;; IS: estate Guix channel packaging Idris2 0.7.0 built from its checked-in Scheme bootstrap.
+;; IS-NOT: not Idris2 upstream; not the proven-tests-and-benches CI installer;
+;; not the per-repo toolchain pins (those stay in each consumer's build/).
+(repo-deed
+  :schema-version "1.0.0"
+  :canonical-name "guix-channel"
+  :repo-uuid #uuid"335ef43f-9709-8e37-be22-b170134a82f9"
+  :beholding-chora #uuid"0889b37b-defb-831f-973c-e119500db00e"
+  (identity :owner "hyperpolymath" :primary-forge github :prefixed-name "guix-channel")
+  (forges :github "hyperpolymath/guix-channel")
+  (lineage :type standalone :parent "" :born "2026-11-25"))
