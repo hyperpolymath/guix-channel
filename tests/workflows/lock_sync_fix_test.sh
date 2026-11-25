@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
+# Self-test for scripts/lock-sync-fix.sh. No network: the resolver is swapped for
+# a table-driven fake through LOCK_SYNC_RESOLVER.
+# Usage: bash tests/workflows/lock_sync_fix_test.sh
+set -euo pipefail
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+AWK_T=$(command -v gawk || command -v mawk || command -v awk)
+fix="$repo/scripts/lock-sync-fix.sh"
+check="$repo/scripts/check-lock-sync.sh"
+fail() { echo "FAIL: $*" >&2; [ -f "$work/out" ] && cat "$work/out" >&2; exit 1; }
+
+S1=1111111111111111111111111111111111111111
+S2=2222222222222222222222222222222222222222
+S3=3333333333333333333333333333333333333333
+S4=4444444444444444444444444444444444444444
+
+# fake resolver; table lines: "tag owner/repo ref sha" and "ids owner/repo oid rid"
+cat > "$work/resolver" <<'R'
+#!/usr/bin/env bash
+echo "$*" >> "$FAKE_LOG"
+case "$1" in
+  tag)    awk -v k="$2 $3" '$1 == "tag" && $2 " " $3 == k { print $4; f = 1 } END { exit !f }' "$FAKE_TABLE" ;;
+  ids)    awk -v k="$2" '$1 == "ids" && $2 == k { print $3, $4; f = 1 } END { exit !f }' "$FAKE_TABLE" ;;
+  nested) awk -v k="$2${4:+/$4}" '$1 == "nested" && $2 == k { print $3 }' "$FAKE_TABLE" ;;
+  *) exit 2 ;;
+esac
+R
+chmod +x "$work/resolver"
+export LOCK_SYNC_RESOLVER="$work/resolver" FAKE_TABLE="$work/table" FAKE_LOG="$work/log"
+
+# fixture: two workflows share upload-artifact; ci.yml also SHA-pins setup
+fresh() {
+  rm -rf "$work/wf"; mkdir -p "$work/wf"; : > "$work/log"
+  cat > "$work/wf/ci.yml" <<YML
+name: CI
+on: pull_request
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v2.0.0
+      - uses: Acme/Setup@$S3 # v3.0.0
+YML
+  cat > "$work/wf/other.yml" <<'YML'
+name: Other
+on: pull_request
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v1.0.0
+YML
+  cat > "$work/wf/actions.lock" <<LOCK
+# header comment
+version: 'v0.0.3'
+workflows:
+    '.github/workflows/ci.yml':
+        - 'acme/setup@$S1'
+        - 'actions/upload-artifact@v1.0.0'
+    '.github/workflows/other.yml':
+        - 'actions/upload-artifact@v1.0.0'
+dependencies:
+    'acme/setup@$S1':
+        ref: 'v1.0.0'
+        commit: 'sha1-$S1'
+        owner_id: 7
+        repo_id: 8
+    'actions/upload-artifact@v1.0.0':
+        ref: 'v1.0.0'
+        commit: 'sha1-$S1'
+        owner_id: 44036562
+        repo_id: 192625955
+LOCK
+  cat > "$work/table" <<TBL
+tag actions/upload-artifact v2.0.0 $S2
+tag acme/setup v3.0.0 $S3
+TBL
+}
+run_fix() { "$fix" "$work/wf" > "$work/out" 2>&1; }
+
+# 1. stale lock (Dependabot bumped ci.yml only): gate red before, green after
+fresh
+"$check" "$work/wf" > "$work/out" 2>&1 && fail "fixture should start out of sync"
+run_fix || fail "fixer failed on a resolvable stale lock"
+"$check" "$work/wf" > "$work/out" 2>&1 || fail "check-lock-sync.sh still red after the fix"
+grep -qF "'actions/upload-artifact@v2.0.0':" "$work/wf/actions.lock" || fail "new tag record missing"
+grep -qF "commit: 'sha1-$S2'" "$work/wf/actions.lock" || fail "new tag commit not recorded"
+rec=$("$AWK_T" -v k="    'actions/upload-artifact@v2.0.0':" '$0 == k { on = 1; next } /^    [^ ]/ { on = 0 } on { print }' "$work/wf/actions.lock")
+grep -qxF "        owner_id: 44036562" <<< "$rec" || fail "owner_id not reused into the v2.0.0 record"
+grep -qxF "        repo_id: 192625955" <<< "$rec" || fail "repo_id not reused into the v2.0.0 record"
+grep -qF "'actions/upload-artifact@v1.0.0':" "$work/wf/actions.lock" || fail "record still used by other.yml was dropped"
+grep -qF "'acme/setup@$S3':" "$work/wf/actions.lock" || fail "SHA-pinned record missing"
+grep -qF "ref: 'v3.0.0'" "$work/wf/actions.lock" || fail "SHA-pinned record lost its tag ref"
+grep -qF "'acme/setup@$S1'" "$work/wf/actions.lock" && fail "orphaned old record not dropped"
+first_line=$(head -1 "$work/wf/actions.lock")
+grep -qF "# header comment" <<< "$first_line" || fail "lock header not preserved"
+grep -q '^tag actions/upload-artifact v1.0.0' "$work/log" && fail "re-resolved an unchanged record"
+
+# 2. idempotent: second run changes nothing and asks the resolver nothing
+cp "$work/wf/actions.lock" "$work/first.lock"; : > "$work/log"
+run_fix || fail "second run failed"
+cmp -s "$work/first.lock" "$work/wf/actions.lock" || fail "second run changed the lock"
+[ ! -s "$work/log" ] || fail "second run called the resolver"
+
+# 3. new action in a new repo takes its ids from the resolver
+fresh
+sed -i 's#actions/upload-artifact@v2.0.0#newowner/newrepo@v9.9.9#' "$work/wf/ci.yml"
+printf 'tag newowner/newrepo v9.9.9 %s\nids newowner/newrepo 5 6\n' "$S4" >> "$work/table"
+run_fix || fail "fixer failed for a new repo"
+"$check" "$work/wf" > "$work/out" 2>&1 || fail "gate red after adding a new repo"
+grep -qF "owner_id: 5" "$work/wf/actions.lock" || fail "resolver ids not used"
+
+# 4. negative control: an unresolvable ref fails loudly and leaves the lock untouched
+fresh
+cp "$work/wf/actions.lock" "$work/before.lock"
+sed -i '/upload-artifact v2.0.0/d' "$work/table"
+if run_fix; then fail "unresolvable ref must exit non-zero"; fi
+grep -q 'cannot resolve' "$work/out" || fail "failure must say why"
+cmp -s "$work/before.lock" "$work/wf/actions.lock" || fail "lock modified despite failure"
+"$check" "$work/wf" > /dev/null 2>&1 && fail "gate must stay red after a failed fix"
+
+# 5. negative control: SHA pin whose comment tag resolves elsewhere is refused
+fresh
+printf 'tag acme/setup v3.0.0 %s\n' "$S4" > "$work/table"
+printf 'tag actions/upload-artifact v2.0.0 %s\n' "$S2" >> "$work/table"
+if run_fix; then fail "mismatched SHA/tag must exit non-zero"; fi
+grep -q 'refusing to record a mismatched pin' "$work/out" || fail "mismatch not reported"
+
+# 6. negative control: SHA pin with no tag comment is refused
+fresh
+sed -i "s/ # v3.0.0//" "$work/wf/ci.yml"
+if run_fix; then fail "SHA pin without a tag comment must exit non-zero"; fi
+grep -q "no trailing '# <tag>' comment" "$work/out" || fail "missing-comment not reported"
+
+# 7. negative control: a new action with nested external uses: is refused, not half-recorded
+fresh
+printf 'nested actions/upload-artifact someorg/inner@v1\n' >> "$work/table"
+cp "$work/wf/actions.lock" "$work/before.lock"
+if run_fix; then fail "nested uses must exit non-zero"; fi
+grep -q 'nested external uses' "$work/out" || fail "nested uses not reported"
+cmp -s "$work/before.lock" "$work/wf/actions.lock" || fail "lock modified despite nested-uses failure"
+
+
+# 8. a SUBPATH action's own manifest is probed (not just the repo root)
+fresh
+sed -i 's#actions/upload-artifact@v2.0.0#newowner/newrepo/tools/deep@v9.9.9#' "$work/wf/ci.yml"
+printf 'tag newowner/newrepo v9.9.9 %s\nids newowner/newrepo 5 6\n' "$S4" >> "$work/table"
+printf 'nested newowner/newrepo/tools/deep someorg/inner@v1\n' >> "$work/table"
+cp "$work/wf/actions.lock" "$work/before.lock"
+if run_fix; then fail "nested uses in a subpath manifest must exit non-zero"; fi
+grep -q 'nested external uses' "$work/out" || fail "subpath nested uses not reported"
+grep -q '^nested newowner/newrepo .* tools/deep' "$work/log" || fail "resolver was not asked for the subpath manifest"
+cmp -s "$work/before.lock" "$work/wf/actions.lock" || fail "lock modified despite subpath nested-uses failure"
+
+# 9. a ref used only as a JOB-LEVEL reusable target is not recorded; text in a
+#    run: block and a flow-mapping step are read correctly
+fresh
+cat > "$work/wf/ci.yml" <<YML
+name: CI
+on: pull_request
+jobs:
+  call:
+    uses: Acme/Reuse/.github/workflows/x.yml@v7.0.0
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo example
+          uses: fake/inblock@v1
+      - {uses: actions/upload-artifact@v2.0.0}
+      - uses: Acme/Setup@$S3 # v3.0.0
+YML
+run_fix || fail "fixer failed on job-level + block + flow fixture"
+"$check" "$work/wf" > "$work/out" 2>&1 || fail "gate red after fixing the mixed fixture"
+grep -qi "acme/reuse" "$work/wf/actions.lock" && fail "a job-level reusable target was recorded in the lock"
+grep -q "fake/inblock" "$work/wf/actions.lock" && fail "uses: text inside a run: block was recorded"
+grep -qF "'actions/upload-artifact@v2.0.0':" "$work/wf/actions.lock" || fail "flow-mapping step was not recorded"
+grep -q 'acme/reuse\|fake/inblock' "$work/log" && fail "resolver was asked about a non-recorded ref"
+
+# 10. a lock whose version: line comes FIRST keeps its (empty) header intact
+fresh
+{ grep -m1 '^version:' "$work/wf/actions.lock"; grep -v '^version:' "$work/wf/actions.lock" | grep -v '^# header'; } > "$work/vf.lock"
+cp "$work/vf.lock" "$work/wf/actions.lock"
+run_fix || fail "fixer failed on a version-first lock"
+"$check" "$work/wf" > "$work/out" 2>&1 || fail "gate red after fixing a version-first lock"
+[ "$(grep -c '^version:' "$work/wf/actions.lock")" = 1 ] || fail "version line duplicated or lost"
+grep -q '^workflows:' "$work/wf/actions.lock" || fail "workflows: section lost"
+
+# 11. staged validation. The candidate must PASS every earlier probe and be
+# rejected ONLY by the staged check-lock-sync.sh run: a kept record carries a
+# dangling nested edge (never re-probed, because the record is unchanged). A
+# nested-uses refusal would end the run before the stage directory exists, so it
+# could not prove staging at all.
+fresh
+sed -i "s#^        repo_id: 192625955#        repo_id: 192625955\n        uses:\n            - 'ghost/dep@v1'#" "$work/wf/actions.lock"
+grep -qF "ghost/dep@v1" "$work/wf/actions.lock" || fail "fixture: dangling edge not planted"
+cp "$work/wf/actions.lock" "$work/before.lock"
+if run_fix; then fail "a candidate the staged checker rejects must fail"; fi
+grep -qF "the repaired lock fails check-lock-sync.sh" "$work/out" || fail "staged checker did not run/reject (wrong refusal path)"
+grep -qF "nested external uses" "$work/out" && fail "refused by the nested probe, not by staging"
+grep -qF "DANGLING EDGES" "$work/out" || fail "staged checker output not surfaced"
+cmp -s "$work/before.lock" "$work/wf/actions.lock" || fail "lock changed"
+[ -z "$(ls "$work/wf" | grep -F 'actions.lock.tmp' || true)" ] || fail "temp file left behind"
+grep -q '^nested ' "$work/log" || fail "the nested probe did not run before staging"
+
+# 12. CodeRabbit #474: `{uses: x}` inside a QUOTED scalar is data, never an action
+fresh
+sed -i "s#^      - uses: actions/upload-artifact@v2.0.0#      - run: \"echo '{uses: fake/thing@v9}'\"\n      - uses: actions/upload-artifact@v2.0.0#" "$work/wf/ci.yml"
+grep -qF "fake/thing@v9" "$work/wf/ci.yml" || fail "fixture: quoted scalar not planted"
+run_fix || fail "the fixer tried to resolve a uses: that sits inside a quoted scalar"
+grep -q 'fake/thing' "$work/log" && fail "resolver asked about fake/thing"
+grep -qF "fake/thing" "$work/wf/actions.lock" && fail "fake/thing recorded in the lock"
+"$check" "$work/wf" > "$work/out" 2>&1 || fail "check-lock-sync.sh red after the fix"
+
+# 13. CodeRabbit #474: a subpath-only use must not probe the UNRELATED root manifest
+fresh
+sed -i 's#actions/upload-artifact@v2.0.0#actions/upload-artifact/sub@v2.0.0#' "$work/wf/ci.yml"
+printf 'nested actions/upload-artifact someorg/rootdep@v1\n' >> "$work/table"
+run_fix || fail "a leaf subpath was refused because of its unrelated root manifest"
+grep -q '^nested actions/upload-artifact [0-9a-f]\{40\}$' "$work/log" && fail "probed the root manifest of a subpath-only ref"
+grep -q '^nested actions/upload-artifact [0-9a-f]\{40\} sub$' "$work/log" || fail "the subpath manifest was not probed"
+
+# 14. control: root AND subpath used (either order): BOTH manifests are still probed
+for order in "sub-first" "root-first"; do
+  fresh
+  if [ "$order" = sub-first ]; then
+    sed -i "s#^      - uses: actions/upload-artifact@v2.0.0#      - uses: actions/upload-artifact/sub@v2.0.0\n      - uses: actions/upload-artifact@v2.0.0#" "$work/wf/ci.yml"
+  else
+    sed -i "s#^      - uses: actions/upload-artifact@v2.0.0#      - uses: actions/upload-artifact@v2.0.0\n      - uses: actions/upload-artifact/sub@v2.0.0#" "$work/wf/ci.yml"
+  fi
+  printf 'nested actions/upload-artifact someorg/rootdep@v1\n' >> "$work/table"
+  if run_fix; then fail "root manifest nested uses accepted when both root and subpath are used ($order)"; fi
+  grep -qF "nested external uses" "$work/out" || fail "wrong refusal for root nested ($order)"
+  fresh
+  if [ "$order" = sub-first ]; then
+    sed -i "s#^      - uses: actions/upload-artifact@v2.0.0#      - uses: actions/upload-artifact/sub@v2.0.0\n      - uses: actions/upload-artifact@v2.0.0#" "$work/wf/ci.yml"
+  else
+    sed -i "s#^      - uses: actions/upload-artifact@v2.0.0#      - uses: actions/upload-artifact@v2.0.0\n      - uses: actions/upload-artifact/sub@v2.0.0#" "$work/wf/ci.yml"
+  fi
+  printf 'nested actions/upload-artifact/sub someorg/subdep@v1\n' >> "$work/table"
+  if run_fix; then fail "subpath manifest nested uses accepted when both root and subpath are used ($order)"; fi
+  grep -qF "nested external uses" "$work/out" || fail "wrong refusal for sub nested ($order)"
+done
+
+echo "lock_sync_fix_test: all cases passed"
